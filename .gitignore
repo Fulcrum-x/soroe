@@ -1,0 +1,5 @@
+desktop.ini
+__pycache__/
+.scratch/
+.venv/
+*.pyc
