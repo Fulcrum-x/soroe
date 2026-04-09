@@ -7,9 +7,9 @@ is offset from the other, so you can mux tracks between them with the correct de
 Requires: numpy, scipy, ffmpeg (on PATH)
 
 Usage:
-    python soroe.py file1.mkv file2.mkv
-    python soroe.py file1.mkv file2.mkv --fps 23.976
-    python soroe.py file1.mkv file2.mkv --duration 300 --verbose
+    uv run soroe file1.mkv file2.mkv
+    uv run soroe file1.mkv file2.mkv --fps 23.976
+    uv run soroe file1.mkv file2.mkv --duration 300 --verbose
 """
 
 from __future__ import annotations
