@@ -1,6 +1,6 @@
 # soroe
 
-Find the temporal offset between two MKV files of the same content. Useful for muxing tracks between different releases with the correct delay.
+Find the offset between two MKV files of the same content.
 
 Uses audio cross-correlation to determine how many milliseconds (and frames) one file is shifted relative to the other.
 
@@ -60,11 +60,11 @@ Offset (frames): -98.46 frames @ 23.976fps
 Frame-aligned offset: -4087 ms (-98 frames)
 ```
 
-## How it works
+## Notes
 
-1. Extracts audio from both files via ffmpeg (mono, 16 kHz, piped — no temp files)
-2. Computes cross-correlation using `scipy.signal.fftconvolve`
-3. The lag at the correlation peak gives the sample offset, converted to milliseconds
-4. Confidence is the ratio of the primary peak to the next-highest non-adjacent peak
+- Extracts audio from both files via ffmpeg (mono, 16 kHz, piped — no temp files)
+- Computes cross-correlation using `scipy.signal.fftconvolve`
+- The lag at the correlation peak gives the sample offset, converted to milliseconds
+- Confidence is the ratio of the primary peak to the next-highest non-adjacent peak
 
 A positive offset means file2 starts after file1. A negative offset means file1 starts after file2.
