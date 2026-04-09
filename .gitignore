@@ -1,5 +1,6 @@
 desktop.ini
 __pycache__/
+.guidance/
 .scratch/
 .venv/
 *.pyc

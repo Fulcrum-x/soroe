@@ -153,11 +153,25 @@ def audio_correlate(
 
 
 
+def _confidence_label(ratio: float) -> str:
+    """Human-readable confidence mapping."""
+    if ratio >= 10:
+        return "excellent"
+    if ratio >= 5:
+        return "good"
+    if ratio >= 3:
+        return "fair"
+    if ratio >= 1.5:
+        return "poor"
+    return "unreliable"
+
+
 # Output formatting
 def format_result(result: dict) -> str:
     lines: list[str] = []
     lines.append(f"Method: {result['method']}")
-    lines.append(f"Confidence: {result['confidence']:.2f}")
+    conf = result["confidence"]
+    lines.append(f"Confidence: {_confidence_label(conf)} ({conf:.2f}x peak ratio)")
 
     ms = result["offset_ms"]
     if ms >= 0:
