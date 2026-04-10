@@ -1,6 +1,6 @@
 # soroe
 
-Find the temporal offset between two audio/video files of the same content. Useful for muxing tracks between different releases with the correct delay.
+Find the temporal offset(s) between two audio/video files of the same content.
 
 Uses audio cross-correlation to determine how many milliseconds (and frames) one file is shifted relative to the other. Supports any format ffmpeg can read (MKV, MP4, FLAC, WAV, EAC3, M4A, MKA, etc.).
 
