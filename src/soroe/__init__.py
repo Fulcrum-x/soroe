@@ -11,6 +11,7 @@ Requires: numpy, scipy, ffmpeg (on PATH)
 Usage:
     uv run soroe file1.mkv file2.mkv
     uv run soroe file1.mkv file2.mkv --duration 300 --verbose
+    uv run soroe file1.flac file2.flac --drift --drift-threshold 80
 """
 
 from __future__ import annotations
