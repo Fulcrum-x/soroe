@@ -24,6 +24,8 @@ import sys
 import numpy as np
 from scipy.signal import fftconvolve
 
+from soroe import log
+
 # Constants
 SAMPLE_RATE = 16_000          # Hz - mono 16 kHz for audio correlation
 
@@ -31,12 +33,12 @@ SAMPLE_RATE = 16_000          # Hz - mono 16 kHz for audio correlation
 # Helpers
 def _log(msg: str, verbose: bool) -> None:
     if verbose:
-        print(f"[soroe] {msg}", file=sys.stderr)
+        log.info(msg)
 
 
 def _check_file(path: str) -> None:
     if not os.path.isfile(path):
-        print(f"Error: file not found: {path}", file=sys.stderr)
+        log.error(f"file not found: {path}")
         sys.exit(1)
 
 
@@ -55,10 +57,10 @@ def _run_ffprobe(path: str, stream_type: str) -> bool:
         )
         return bool(r.stdout.strip())
     except FileNotFoundError:
-        print("Error: ffprobe not found. Make sure ffmpeg is installed and on PATH.", file=sys.stderr)
+        log.error("ffprobe not found. Make sure ffmpeg is installed and on PATH.")
         sys.exit(1)
     except subprocess.TimeoutExpired:
-        print(f"Error: ffprobe timed out on {path}", file=sys.stderr)
+        log.error(f"ffprobe timed out on {path}")
         sys.exit(1)
 
 
@@ -98,7 +100,7 @@ def _get_duration(path: str) -> float:
         )
         return float(r.stdout.strip())
     except (ValueError, subprocess.TimeoutExpired):
-        print(f"Error: could not determine duration of {path}", file=sys.stderr)
+        log.error(f"could not determine duration of {path}")
         sys.exit(1)
 
 
@@ -129,17 +131,17 @@ def extract_audio(path: str, duration: int, audio_track: int, verbose: bool) -> 
     raw, err = proc.communicate()
     if proc.returncode != 0:
         msg = err.decode(errors="replace").strip()
-        print(f"Error: ffmpeg failed on {path}: {msg}", file=sys.stderr)
+        log.error(f"ffmpeg failed on {path}: {msg}")
         sys.exit(1)
     if not raw:
-        print(f"Error: no audio data extracted from {path}. Check that the file has an audio track.", file=sys.stderr)
+        log.error(f"no audio data extracted from {path}. Check that the file has an audio track.")
         sys.exit(1)
 
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     peak = np.max(np.abs(samples))
     if peak > 0:
         samples /= peak
-    _log(f"  Got {len(samples)} samples ({len(samples)/SAMPLE_RATE:.1f}s)", verbose)
+    _log(f" + Got {len(samples)} samples ({len(samples)/SAMPLE_RATE:.1f}s)", verbose)
     return samples
 
 
@@ -181,7 +183,7 @@ def audio_correlate(
     secondary = _find_secondary_peak(corr, peak_idx, min_distance=SAMPLE_RATE // 2)
     confidence = peak_val / secondary if secondary > 0 else float("inf")
 
-    _log(f"  Peak at lag={lag_samples} samples, confidence={confidence:.2f}", verbose)
+    _log(f" + Peak at lag={lag_samples} samples, confidence={confidence:.2f}", verbose)
 
     result: dict = {
         "method": "audio cross-correlation",
@@ -230,6 +232,11 @@ def format_result(result: dict) -> str:
         fps = result["fps"]
         lines.append(f"Offset (frames): {result['offset_frames']:.2f} frames @ {fps}fps")
         lines.append(f"Nearest frame: {result['nearest_frame']}")
+
+    if conf < 3:
+        lines.append("")
+        log.warn("low confidence may indicate offset variability across the timeline.")
+        log.warn("try running with --drift to check for change points.")
 
     return "\n".join(lines)
 
@@ -347,6 +354,8 @@ def drift_analysis(
     for i, pos in enumerate(positions):
         actual_win = min(window_samples, total_samples - pos)
         _log(f"Analyzing window {i + 1}/{len(positions)} …", verbose)
+        if not verbose:
+            log.progress(i, len(positions), "Scanning windows")
         result = correlate_window(sig_a, sig_b, pos, actual_win, search_radius_samples)
         if result is not None:
             offset_ms, confidence = result
@@ -389,7 +398,7 @@ def drift_analysis(
             t_start = prev["timestamp_s"]
             t_end = min(curr["timestamp_s"] + window_s, total_duration_s)
             _log(
-                f"  Refining change between {_format_timestamp(t_start)} "
+                f" + Refining change between {_format_timestamp(t_start)} "
                 f"and {_format_timestamp(t_end)} …",
                 verbose,
             )
@@ -559,9 +568,23 @@ def main() -> None:
     _check_file(args.file1)
     _check_file(args.file2)
 
-    if not _run_ffprobe(args.file1, "audio") or not _run_ffprobe(args.file2, "audio"):
-        print("Error: one or both files lack an audio track.", file=sys.stderr)
+    # Guard: same file
+    if os.path.realpath(args.file1) == os.path.realpath(args.file2):
+        log.error("both arguments point to the same file.")
         sys.exit(1)
+
+    if not _run_ffprobe(args.file1, "audio") or not _run_ffprobe(args.file2, "audio"):
+        log.error("one or both files lack an audio track.")
+        sys.exit(1)
+
+    # Warn if durations differ significantly (likely different sources)
+    dur1 = _get_duration(args.file1)
+    dur2 = _get_duration(args.file2)
+    if abs(dur1 - dur2) > 240:
+        log.warn(
+            f"file durations differ by {abs(dur1 - dur2):.0f}s "
+            f"({dur1:.0f}s vs {dur2:.0f}s). These may be different sources."
+        )
 
     # Auto-detect FPS from the first file with a video stream
     fps = _get_fps(args.file1) or _get_fps(args.file2)
@@ -572,17 +595,22 @@ def main() -> None:
     if args.duration is not None:
         duration = args.duration
     elif args.drift:
-        dur1 = _get_duration(args.file1)
-        dur2 = _get_duration(args.file2)
         duration = int(min(dur1, dur2))
         _log(f"Auto-detected duration: {duration}s (from shorter file)", args.verbose)
     else:
         duration = 600
 
+    if not args.verbose:
+        log.progress(0, 4, "Extracting audio (file 1)")
     sig_a = extract_audio(args.file1, duration, args.audio_track, args.verbose)
+
+    if not args.verbose:
+        log.progress(1, 4, "Extracting audio (file 2)")
     sig_b = extract_audio(args.file2, duration, args.audio_track, args.verbose)
 
     if args.drift:
+        if not args.verbose:
+            log.progress(2, 4, "Analyzing drift")
         result = drift_analysis(
             sig_a, sig_b,
             window_s=args.drift_window,
@@ -591,9 +619,15 @@ def main() -> None:
             fps=fps,
             verbose=args.verbose,
         )
+        if not args.verbose:
+            log.progress_clear()
         print(format_drift_result(result, fps))
     else:
+        if not args.verbose:
+            log.progress(2, 4, "Computing correlation")
         result = audio_correlate(sig_a, sig_b, fps, args.verbose)
+        if not args.verbose:
+            log.progress_clear()
         print(format_result(result))
 
 
