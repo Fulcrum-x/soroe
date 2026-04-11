@@ -10,13 +10,13 @@ Uses audio cross-correlation to determine how many milliseconds (and frames) one
 - [ffmpeg](https://ffmpeg.org/) on PATH
 - [uv](https://docs.astral.sh/uv/)
 
-## Setup
+## Install
 
 ```sh
-git clone https://gitea.okami.icu/fulcrum/soroe.git
-cd soroe
-uv sync
+uv tool install git+https://gitea.okami.icu/fulcrum/soroe
 ```
+
+This installs `soroe` as a global command on your PATH. To upgrade later, run `uv tool upgrade soroe`.
 
 ## Usage
 
@@ -25,7 +25,7 @@ uv sync
 Find the global offset between two files:
 
 ```sh
-uv run soroe file1.mkv file2.mkv
+soroe file1.mkv file2.mkv
 ```
 
 If either file has a video stream, framerate is auto-detected via ffprobe and frame offset is shown automatically.
@@ -46,12 +46,12 @@ If either file has a video stream, framerate is auto-detected via ffprobe and fr
 
 Analyze only the first 2 minutes, using the second audio track:
 ```sh
-uv run soroe release_a.mkv release_b.mkv --duration 120 --audio-track 1 --verbose
+soroe release_a.mkv release_b.mkv --duration 120 --audio-track 1 --verbose
 ```
 
 Compare two audio files directly:
 ```sh
-uv run soroe source.flac remux.m4a
+soroe source.flac remux.m4a
 ```
 
 ### Example output
@@ -71,8 +71,8 @@ The `--drift` flag enables windowed analysis across the full timeline, detecting
 When `--drift` is used without `--duration`, the full file length is analyzed automatically.
 
 ```sh
-uv run soroe file1.flac file2.flac --drift
-uv run soroe file1.flac file2.flac --drift --drift-threshold 80 --verbose
+soroe file1.flac file2.flac --drift
+soroe file1.flac file2.flac --drift --drift-threshold 80 --verbose
 ```
 
 ### How drift detection works

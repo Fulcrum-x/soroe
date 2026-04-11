@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
-soroe = "soroe:main"
+soroe = "soroe.cli:main"
 
 [build-system]
 requires = ["hatchling"]
