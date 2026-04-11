@@ -20,6 +20,7 @@ import argparse
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 from scipy.signal import fftconvolve
@@ -215,28 +216,63 @@ def _confidence_label(ratio: float) -> str:
     return "unreliable"
 
 
+def _confidence_colored(ratio: float) -> str:
+    label = _confidence_label(ratio)
+    color = {
+        "excellent": log.green,
+        "good": log.green,
+        "fair": log.yellow,
+        "poor": log.red,
+        "unreliable": log.red,
+    }[label]
+    return color(label)
+
+
+def _header(title: str) -> list[str]:
+    text = f"soroe · {title}"
+    return [log.bold(text), log.dim("─" * len(text))]
+
+
+def _kv(key: str, value: str, note: str = "") -> str:
+    line = f"  {log.dim(key.ljust(12))}{value}"
+    if note:
+        line += "  " + log.dim(note)
+    return line
+
+
+def _fmt_offset(ms: float) -> str:
+    sign = "+" if ms >= 0 else ""
+    return f"{sign}{ms:.0f} ms"
+
+
 def format_result(result: dict) -> str:
-    lines: list[str] = []
-    lines.append(f"Method: {result['method']}")
-    conf = result["confidence"]
-    lines.append(f"Confidence: {_confidence_label(conf)} ({conf:.2f}x peak ratio)")
+    lines: list[str] = _header(result["method"])
+    lines.append("")
 
     ms = result["offset_ms"]
     if ms >= 0:
-        desc = f"file2 starts {ms:.0f}ms after file1"
+        desc = f"file2 delayed by {ms:.0f} ms"
     else:
-        desc = f"file1 starts {-ms:.0f}ms after file2"
-    lines.append(f"Offset: {ms:.0f} ms ({desc})")
+        desc = f"file1 delayed by {-ms:.0f} ms"
+    lines.append(_kv("Offset", log.bold(_fmt_offset(ms)), desc))
 
     if "fps" in result:
         fps = result["fps"]
-        lines.append(f"Offset (frames): {result['offset_frames']:.2f} frames @ {fps}fps")
-        lines.append(f"Nearest frame: {result['nearest_frame']}")
+        frames = result["offset_frames"]
+        nearest = result["nearest_frame"]
+        sign_f = "+" if frames >= 0 else ""
+        lines.append(_kv(
+            "Frames",
+            log.bold(f"{sign_f}{frames:.2f}"),
+            f"@ {fps:.3f} fps · nearest: {nearest}",
+        ))
 
-    if conf < 3:
-        lines.append("")
-        log.warn("low confidence may indicate offset variability across the timeline.")
-        log.warn("try running with --drift to check for change points.")
+    conf = result["confidence"]
+    lines.append(_kv(
+        "Confidence",
+        _confidence_colored(conf),
+        f"{conf:.2f}x peak ratio",
+    ))
 
     return "\n".join(lines)
 
@@ -342,7 +378,7 @@ def drift_analysis(
     total_samples = min(len(sig_a), len(sig_b))
     total_duration_s = total_samples / SAMPLE_RATE
 
-    # Pass 1: coarse windowed cross-correlation
+    # Pass 1: coarse windowed cross-correlation (parallel across windows)
     _log("Pass 1: coarse windowed cross-correlation …", verbose)
     positions: list[int] = []
     pos = 0
@@ -350,17 +386,34 @@ def drift_analysis(
         positions.append(pos)
         pos += step_samples
 
+    results_by_pos: dict[int, tuple[float, float] | None] = {}
+    workers = min(len(positions), os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(
+                correlate_window,
+                sig_a, sig_b, p,
+                min(window_samples, total_samples - p),
+                search_radius_samples,
+            ): p
+            for p in positions
+        }
+        completed = 0
+        for fut in as_completed(futures):
+            p = futures[fut]
+            results_by_pos[p] = fut.result()
+            completed += 1
+            _log(f"Analyzed window {completed}/{len(positions)}", verbose)
+            if not verbose:
+                log.progress(completed, len(positions), "Scanning windows")
+
     coarse: list[dict] = []
-    for i, pos in enumerate(positions):
-        actual_win = min(window_samples, total_samples - pos)
-        _log(f"Analyzing window {i + 1}/{len(positions)} …", verbose)
-        if not verbose:
-            log.progress(i, len(positions), "Scanning windows")
-        result = correlate_window(sig_a, sig_b, pos, actual_win, search_radius_samples)
+    for p in positions:
+        result = results_by_pos.get(p)
         if result is not None:
             offset_ms, confidence = result
             coarse.append({
-                "timestamp_s": pos / SAMPLE_RATE,
+                "timestamp_s": p / SAMPLE_RATE,
                 "offset_ms": offset_ms,
                 "confidence": confidence,
             })
@@ -476,74 +529,71 @@ def drift_analysis(
 
 
 # Output formatting
+def _format_segment(seg: dict, fps: float | None) -> str:
+    ts0 = _format_timestamp(seg["start_s"])
+    ts1 = _format_timestamp(seg["end_s"])
+    time_range = log.dim(f"{ts0} → {ts1}")
+
+    if seg["offset_ms"] is None:
+        return f"    {time_range}  {log.yellow('transition')}"
+
+    off = seg["offset_ms"]
+    conf_val = seg["confidence"]
+    offset_str = log.bold(_fmt_offset(off).rjust(8))
+    conf_str = f"{_confidence_colored(conf_val)} {log.dim(f'({conf_val:.2f}x)')}"
+
+    parts = [f"    {time_range}", offset_str, conf_str]
+    if fps is not None:
+        frames = off / 1000.0 * fps
+        sign = "+" if frames >= 0 else ""
+        parts.append(log.dim(f"{sign}{frames:.1f} frames"))
+    return "  ".join(parts)
+
+
 def format_drift_result(result: dict, fps: float | None) -> str:
     """Format drift-analysis *result* for human consumption."""
-    lines: list[str] = []
+    lines: list[str] = _header("drift analysis")
     w = result["window_s"]
     thr = result["threshold_ms"]
-    lines.append(f"Drift analysis ({w}s windows, {thr}ms threshold)")
-    lines.append("=" * 46)
+    lines.append(log.dim(f"  {w}s windows · {thr}ms threshold"))
     lines.append("")
 
     if result["no_drift"]:
-        seg = result["segments"][0]
-        off = seg["offset_ms"]
-        conf = _confidence_label(seg["confidence"])
-        sign = "+" if off >= 0 else ""
-        lines.append("No drift detected.")
+        lines.append(f"  {log.green('No drift detected.')}")
         lines.append("")
-        lines.append("Segments:")
-        ts0 = _format_timestamp(seg["start_s"])
-        ts1 = _format_timestamp(seg["end_s"])
-        entry = f"  {ts0} - {ts1}  offset: {sign}{off:.0f} ms  (confidence: {conf} ({seg["confidence"]:.2f}x))"
-        if fps is not None:
-            entry += f"  [{off / 1000.0 * fps:+.1f} frames]"
-        lines.append(entry)
-        return "\n".join(lines)
 
-    lines.append("Segments:")
+    lines.append(f"  {log.bold('Segments')}")
     for seg in result["segments"]:
-        ts0 = _format_timestamp(seg["start_s"])
-        ts1 = _format_timestamp(seg["end_s"])
-        if seg["offset_ms"] is None:
-            lines.append(f"  {ts0} - {ts1}  transition")
-        else:
-            off = seg["offset_ms"]
-            conf = _confidence_label(seg["confidence"])
-            sign = "+" if off >= 0 else ""
-            entry = f"  {ts0} - {ts1}  offset: {sign}{off:.0f} ms  (confidence: {conf} ({seg["confidence"]:.2f}x))"
+        lines.append(_format_segment(seg, fps))
+
+    if result["change_points"]:
+        lines.append("")
+        lines.append(f"  {log.bold('Change points')}")
+        for cp in result["change_points"]:
+            ts = _format_timestamp(cp["timestamp_s"])
+            before = cp["offset_before_ms"]
+            after = cp["offset_after_ms"]
+            entry = (
+                f"    {log.dim(ts)}  "
+                f"{log.bold(_fmt_offset(before))} {log.dim('→')} {log.bold(_fmt_offset(after))}"
+            )
             if fps is not None:
-                entry += f"  [{off / 1000.0 * fps:+.1f} frames]"
+                fb = before / 1000.0 * fps
+                fa = after / 1000.0 * fps
+                entry += "  " + log.dim(f"({fb:+.1f} → {fa:+.1f} frames)")
             lines.append(entry)
 
     lines.append("")
-    lines.append("Change points:")
-    for cp in result["change_points"]:
-        ts = _format_timestamp(cp["timestamp_s"])
-        before = cp["offset_before_ms"]
-        after = cp["offset_after_ms"]
-        delta = abs(after - before)
-        sign_b = "+" if before >= 0 else ""
-        sign_a = "+" if after >= 0 else ""
-        entry = (
-            f"  {ts}  offset shifts from {sign_b}{before:.0f} ms "
-            f"to {sign_a}{after:.0f} ms (Δ{delta:.0f} ms)"
-        )
-        if fps is not None:
-            entry += f"  [Δ{delta / 1000.0 * fps:.1f} frames]"
-        lines.append(entry)
-
-    lines.append("")
-    lines.append("Global summary:")
+    lines.append(f"  {log.bold('Summary')}")
     non_transition = [s for s in result["segments"] if s["offset_ms"] is not None]
-    lines.append(f"  Segments: {len(non_transition)}")
-    lines.append(f"  Total change points: {len(result['change_points'])}")
+    lines.append(f"    {log.dim('Segments'.ljust(16))}{len(non_transition)}")
+    lines.append(f"    {log.dim('Change points'.ljust(16))}{len(result['change_points'])}")
     if result["change_points"]:
         max_delta = max(
             abs(cp["offset_after_ms"] - cp["offset_before_ms"])
             for cp in result["change_points"]
         )
-        lines.append(f"  Max drift: {max_delta:.0f} ms")
+        lines.append(f"    {log.dim('Max drift'.ljust(16))}{log.bold(f'{max_delta:.0f} ms')}")
 
     return "\n".join(lines)
 
@@ -601,16 +651,16 @@ def main() -> None:
         duration = 600
 
     if not args.verbose:
-        log.progress(0, 4, "Extracting audio (file 1)")
-    sig_a = extract_audio(args.file1, duration, args.audio_track, args.verbose)
-
-    if not args.verbose:
-        log.progress(1, 4, "Extracting audio (file 2)")
-    sig_b = extract_audio(args.file2, duration, args.audio_track, args.verbose)
+        log.progress(0, 2, "Extracting audio (parallel)")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_a = ex.submit(extract_audio, args.file1, duration, args.audio_track, args.verbose)
+        fut_b = ex.submit(extract_audio, args.file2, duration, args.audio_track, args.verbose)
+        sig_a = fut_a.result()
+        sig_b = fut_b.result()
 
     if args.drift:
         if not args.verbose:
-            log.progress(2, 4, "Analyzing drift")
+            log.progress(1, 2, "Analyzing drift")
         result = drift_analysis(
             sig_a, sig_b,
             window_s=args.drift_window,
@@ -624,11 +674,14 @@ def main() -> None:
         print(format_drift_result(result, fps))
     else:
         if not args.verbose:
-            log.progress(2, 4, "Computing correlation")
+            log.progress(1, 2, "Computing correlation")
         result = audio_correlate(sig_a, sig_b, fps, args.verbose)
         if not args.verbose:
             log.progress_clear()
         print(format_result(result))
+        if result["confidence"] < 3:
+            log.warn("low confidence may indicate offset variability across the timeline.")
+            log.warn("try running with --drift to check for change points.")
 
 
 if __name__ == "__main__":

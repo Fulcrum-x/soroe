@@ -7,11 +7,37 @@ import sys
 
 # ANSI escape codes
 _RESET = "\033[0m"
-_RED = "\033[31m"
-_YELLOW = "\033[33m"
+_BOLD = "\033[1m"
 _DIM = "\033[2m"
+_RED = "\033[31m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
 _CYAN = "\033[36m"
 _CLEAR_LINE = "\033[2K\r"
+
+
+def bold(s: str) -> str:
+    return f"{_BOLD}{s}{_RESET}"
+
+
+def dim(s: str) -> str:
+    return f"{_DIM}{s}{_RESET}"
+
+
+def red(s: str) -> str:
+    return f"{_RED}{s}{_RESET}"
+
+
+def green(s: str) -> str:
+    return f"{_GREEN}{s}{_RESET}"
+
+
+def yellow(s: str) -> str:
+    return f"{_YELLOW}{s}{_RESET}"
+
+
+def cyan(s: str) -> str:
+    return f"{_CYAN}{s}{_RESET}"
 
 
 def error(msg: str) -> None:

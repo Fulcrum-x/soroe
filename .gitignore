@@ -1,7 +1,8 @@
 desktop.ini
 __pycache__/
-.guidance/
+.samples/
 .scratch/
+.claude/
 .venv/
 *.pyc
 *.egg-info/
