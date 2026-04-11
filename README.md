@@ -75,14 +75,6 @@ soroe file1.flac file2.flac --drift
 soroe file1.flac file2.flac --drift --drift-threshold 80 --verbose
 ```
 
-### How drift detection works
-
-1. **Pass 1 — Coarse scan**: Divides both audio streams into overlapping windows (default 30s, 50% overlap). Each window from file A is correlated against a search region in file B (±5s by default), producing a local offset and confidence at each point in the timeline.
-
-2. **Pass 2 — Change point detection**: Identifies where the offset jumps by more than the threshold (default 70ms). Binary-search refinement narrows each change point to ±1 second accuracy.
-
-3. **Pass 3 — Segment compilation**: Groups the timeline into contiguous segments sharing the same offset, separated by short transition zones around each change point.
-
 ### Drift output example
 
 ```
@@ -112,11 +104,5 @@ Global summary:
 - **`--drift-threshold`**: Raise this to ignore small jitter and only report significant jumps. Lower it to catch subtle shifts. Default 70ms.
 - **`--max-drift`**: Sets the search radius around each window position. If the offset between your files could be more than 5 seconds, increase this. Larger values slow down analysis.
 
-## How it works
-
-1. Extracts audio from both files via ffmpeg (mono, 16 kHz, piped to stdout — no temp files)
-2. Computes cross-correlation using `scipy.signal.fftconvolve`
-3. The lag at the correlation peak gives the sample offset, converted to milliseconds
-4. Confidence is the ratio of the primary peak to the next-highest non-adjacent peak (excellent ≥10x, good ≥5x, fair ≥3x, poor ≥1.5x, unreliable <1.5x)
-
+## I'm trying to add my offset but my brain no work good
 A positive offset means file2 starts after file1. A negative offset means file1 starts after file2.
