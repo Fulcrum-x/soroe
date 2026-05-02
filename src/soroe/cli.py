@@ -603,16 +603,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="soroe",
         description="Find the temporal offset between two audio/video files of the same content.",
+        formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=40),
     )
     parser.add_argument("file1", help="First audio/video file")
     parser.add_argument("file2", help="Second audio/video file")
-    parser.add_argument("--duration", type=int, default=None, help="Seconds of content to analyze (default: 600, or full file with --drift)")
-    parser.add_argument("--audio-track", type=int, default=0, help="Audio track index to use (default: 0)")
+    parser.add_argument("--duration", type=int, default=None, metavar="SEC", help="Seconds of content to analyze (default: 600, or full file with --drift)")
+    parser.add_argument("--audio-track", type=int, default=0, metavar="N", help="Audio track index to use (default: 0)")
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress and debug info")
     parser.add_argument("--drift", action="store_true", help="Enable drift/divergence detection mode")
-    parser.add_argument("--drift-window", type=int, default=30, help="Window size in seconds for drift analysis (default: 30)")
-    parser.add_argument("--drift-threshold", type=int, default=70, help="Minimum offset change in ms to count as a change point (default: 70)")
-    parser.add_argument("--max-drift", type=int, default=5, help="Maximum expected drift in seconds - sets the search radius (default: 5)")
+    parser.add_argument("--drift-window", type=int, default=30, metavar="SEC", help="Window size in seconds for drift analysis (default: 30)")
+    parser.add_argument("--drift-threshold", type=int, default=70, metavar="MS", help="Minimum offset change in ms to count as a change point (default: 70)")
+    parser.add_argument("--max-drift", type=int, default=5, metavar="SEC", help="Maximum expected drift in seconds (default: 5)")
     args = parser.parse_args()
 
     _check_file(args.file1)
