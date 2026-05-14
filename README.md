@@ -13,7 +13,7 @@ Uses audio cross-correlation to determine how many milliseconds (and frames) one
 ## Install
 
 ```sh
-uv tool install git+https://gitea.okami.icu/fulcrum/soroe
+uv tool install git+https://github.com/Fulcrum-x/soroe
 ```
 
 This installs `soroe` as a global command on your PATH. To upgrade later, run `uv tool upgrade soroe`.
