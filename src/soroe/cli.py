@@ -634,9 +634,11 @@ def _prepare_signals(
             parts.append(f"{os.path.basename(file1)} has {count1} track{'s' if count1 != 1 else ''}")
         if audio_track >= count2:
             parts.append(f"{os.path.basename(file2)} has {count2} track{'s' if count2 != 1 else ''}")
-        raise SoroeError(
-            f"audio track index {audio_track} not available ({'; '.join(parts)})."
+        log.warn(
+            f"audio track index {audio_track} not available ({'; '.join(parts)}); "
+            f"falling back to track 0."
         )
+        audio_track = 0
 
     dur1 = _get_duration(file1)
     dur2 = _get_duration(file2)
