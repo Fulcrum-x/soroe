@@ -54,6 +54,19 @@ Compare two audio files directly:
 soroe source.flac remux.m4a
 ```
 
+### Batch processing
+
+Pass two directories instead of two files and soroe pairs them up by their `SxxEyy` title (`S01E04`, `s12e09`, `S1E4`) and runs the offset analysis on each match.
+
+```sh
+soroe ./release_a ./release_b
+soroe ./release_a ./release_b --drift
+```
+
+- Files without a recognizable counterpart in the other directory are skipped with a warning and the rest of the run continues.
+- Per-pair results stream to stdout as each pair finishes, prefixed with `[SxxEyy] file_a  <->  file_b` so output is greppable.
+- Directory scanning is non-recursive (top-level only).
+
 ### Example output
 
 ```

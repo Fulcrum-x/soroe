@@ -31,6 +31,11 @@ from . import log
 SAMPLE_RATE = 16_000          # Hz - mono 16 kHz for audio correlation
 
 
+class SoroeError(Exception):
+    """Expected per-input failure. Caught at the top level for a clean exit, or
+    per pair in batch mode so one bad file doesn't abort the whole run."""
+
+
 # Helpers
 def _log(msg: str, verbose: bool) -> None:
     if verbose:
@@ -39,8 +44,7 @@ def _log(msg: str, verbose: bool) -> None:
 
 def _check_file(path: str) -> None:
     if not os.path.isfile(path):
-        log.error(f"file not found: {path}")
-        sys.exit(1)
+        raise SoroeError(f"file not found: {path}")
 
 
 def _run_ffprobe(path: str, stream_type: str) -> bool:
@@ -58,11 +62,11 @@ def _run_ffprobe(path: str, stream_type: str) -> bool:
         )
         return bool(r.stdout.strip())
     except FileNotFoundError:
+        # System-level: ffprobe missing. Always terminates, even in batch mode.
         log.error("ffprobe not found. Make sure ffmpeg is installed and on PATH.")
         sys.exit(1)
     except subprocess.TimeoutExpired:
-        log.error(f"ffprobe timed out on {path}")
-        sys.exit(1)
+        raise SoroeError(f"ffprobe timed out on {path}")
 
 
 def _get_fps(path: str) -> float | None:
@@ -101,8 +105,7 @@ def _get_duration(path: str) -> float:
         )
         return float(r.stdout.strip())
     except (ValueError, subprocess.TimeoutExpired):
-        log.error(f"could not determine duration of {path}")
-        sys.exit(1)
+        raise SoroeError(f"could not determine duration of {path}")
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -128,15 +131,18 @@ def extract_audio(path: str, duration: int, audio_track: int, verbose: bool) -> 
         "-acodec", "pcm_s16le",
         "pipe:1",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        # System-level: ffmpeg missing. Always terminates.
+        log.error("ffmpeg not found. Make sure ffmpeg is installed and on PATH.")
+        sys.exit(1)
     raw, err = proc.communicate()
     if proc.returncode != 0:
         msg = err.decode(errors="replace").strip()
-        log.error(f"ffmpeg failed on {path}: {msg}")
-        sys.exit(1)
+        raise SoroeError(f"ffmpeg failed on {path}: {msg}")
     if not raw:
-        log.error(f"no audio data extracted from {path}. Check that the file has an audio track.")
-        sys.exit(1)
+        raise SoroeError(f"no audio data extracted from {path}. Check that the file has an audio track.")
 
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     peak = np.max(np.abs(samples))
@@ -598,6 +604,112 @@ def format_drift_result(result: dict, fps: float | None) -> str:
     return "\n".join(lines)
 
 
+# Pipelines (shared by single-pair main() and batch.py)
+def _prepare_signals(
+    file1: str,
+    file2: str,
+    duration: int | None,
+    full_duration_if_unset: bool,
+    audio_track: int,
+    verbose: bool,
+) -> tuple[np.ndarray, np.ndarray, float | None]:
+    """Validate inputs and extract aligned-length audio signals from both files.
+
+    Raises SoroeError on any expected per-input failure (missing file, no audio
+    track, ffprobe/ffmpeg failure, same file passed twice).
+    """
+    _check_file(file1)
+    _check_file(file2)
+
+    if os.path.realpath(file1) == os.path.realpath(file2):
+        raise SoroeError("both arguments point to the same file.")
+
+    if not _run_ffprobe(file1, "audio") or not _run_ffprobe(file2, "audio"):
+        raise SoroeError("one or both files lack an audio track.")
+
+    dur1 = _get_duration(file1)
+    dur2 = _get_duration(file2)
+    if abs(dur1 - dur2) > 240:
+        log.warn(
+            f"file durations differ by {abs(dur1 - dur2):.0f}s "
+            f"({dur1:.0f}s vs {dur2:.0f}s). These may be different sources."
+        )
+
+    fps = _get_fps(file1) or _get_fps(file2)
+    if fps is not None:
+        _log(f"Detected framerate: {fps:.3f} fps", verbose)
+
+    if duration is not None:
+        dur = duration
+    elif full_duration_if_unset:
+        dur = int(min(dur1, dur2))
+        _log(f"Auto-detected duration: {dur}s (from shorter file)", verbose)
+    else:
+        dur = 600
+
+    if not verbose:
+        log.progress(0, 2, "Extracting audio (parallel)")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_a = ex.submit(extract_audio, file1, dur, audio_track, verbose)
+        fut_b = ex.submit(extract_audio, file2, dur, audio_track, verbose)
+        sig_a = fut_a.result()
+        sig_b = fut_b.result()
+
+    return sig_a, sig_b, fps
+
+
+def run_single_shot(
+    file1: str,
+    file2: str,
+    duration: int | None,
+    audio_track: int,
+    verbose: bool,
+) -> str:
+    """Run global-offset analysis on one file pair and return the formatted output."""
+    sig_a, sig_b, fps = _prepare_signals(
+        file1, file2, duration, False, audio_track, verbose,
+    )
+    if not verbose:
+        log.progress(1, 2, "Computing correlation")
+    result = audio_correlate(sig_a, sig_b, fps, verbose)
+    if not verbose:
+        log.progress_clear()
+    output = format_result(result)
+    if result["confidence"] < 3:
+        log.warn("low confidence may indicate offset variability across the timeline.")
+        log.warn("try running with --drift to check for change points.")
+    return output
+
+
+def run_drift(
+    file1: str,
+    file2: str,
+    duration: int | None,
+    audio_track: int,
+    drift_window: int,
+    drift_threshold: int,
+    max_drift: int,
+    verbose: bool,
+) -> str:
+    """Run drift analysis on one file pair and return the formatted output."""
+    sig_a, sig_b, fps = _prepare_signals(
+        file1, file2, duration, True, audio_track, verbose,
+    )
+    if not verbose:
+        log.progress(1, 2, "Analyzing drift")
+    result = drift_analysis(
+        sig_a, sig_b,
+        window_s=drift_window,
+        threshold_ms=drift_threshold,
+        max_drift_s=max_drift,
+        fps=fps,
+        verbose=verbose,
+    )
+    if not verbose:
+        log.progress_clear()
+    return format_drift_result(result, fps)
+
+
 # Main
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -605,8 +717,8 @@ def main() -> None:
         description="Find the temporal offset between two audio/video files of the same content.",
         formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=40),
     )
-    parser.add_argument("file1", help="First audio/video file")
-    parser.add_argument("file2", help="Second audio/video file")
+    parser.add_argument("file1", help="First audio/video file or directory")
+    parser.add_argument("file2", help="Second audio/video file or directory")
     parser.add_argument("--duration", type=int, default=None, metavar="SEC", help="Seconds of content to analyze (default: 600, or full file with --drift)")
     parser.add_argument("--audio-track", type=int, default=0, metavar="N", help="Audio track index to use (default: 0)")
     parser.add_argument("--verbose", action="store_true", help="Print detailed progress and debug info")
@@ -616,73 +728,35 @@ def main() -> None:
     parser.add_argument("--max-drift", type=int, default=5, metavar="SEC", help="Maximum expected drift in seconds (default: 5)")
     args = parser.parse_args()
 
-    _check_file(args.file1)
-    _check_file(args.file2)
+    a_is_dir = os.path.isdir(args.file1)
+    b_is_dir = os.path.isdir(args.file2)
 
-    # Guard: same file
-    if os.path.realpath(args.file1) == os.path.realpath(args.file2):
-        log.error("both arguments point to the same file.")
+    try:
+        if a_is_dir != b_is_dir:
+            raise SoroeError("both arguments must be files, or both must be directories.")
+        if a_is_dir:
+            from . import batch
+            batch.run(args)
+        elif args.drift:
+            print(run_drift(
+                args.file1, args.file2,
+                duration=args.duration,
+                audio_track=args.audio_track,
+                drift_window=args.drift_window,
+                drift_threshold=args.drift_threshold,
+                max_drift=args.max_drift,
+                verbose=args.verbose,
+            ))
+        else:
+            print(run_single_shot(
+                args.file1, args.file2,
+                duration=args.duration,
+                audio_track=args.audio_track,
+                verbose=args.verbose,
+            ))
+    except SoroeError as e:
+        log.error(str(e))
         sys.exit(1)
-
-    if not _run_ffprobe(args.file1, "audio") or not _run_ffprobe(args.file2, "audio"):
-        log.error("one or both files lack an audio track.")
-        sys.exit(1)
-
-    # Warn if durations differ significantly (likely different sources)
-    dur1 = _get_duration(args.file1)
-    dur2 = _get_duration(args.file2)
-    if abs(dur1 - dur2) > 240:
-        log.warn(
-            f"file durations differ by {abs(dur1 - dur2):.0f}s "
-            f"({dur1:.0f}s vs {dur2:.0f}s). These may be different sources."
-        )
-
-    # Auto-detect FPS from the first file with a video stream
-    fps = _get_fps(args.file1) or _get_fps(args.file2)
-    if fps is not None:
-        _log(f"Detected framerate: {fps:.3f} fps", args.verbose)
-
-    # Determine duration
-    if args.duration is not None:
-        duration = args.duration
-    elif args.drift:
-        duration = int(min(dur1, dur2))
-        _log(f"Auto-detected duration: {duration}s (from shorter file)", args.verbose)
-    else:
-        duration = 600
-
-    if not args.verbose:
-        log.progress(0, 2, "Extracting audio (parallel)")
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_a = ex.submit(extract_audio, args.file1, duration, args.audio_track, args.verbose)
-        fut_b = ex.submit(extract_audio, args.file2, duration, args.audio_track, args.verbose)
-        sig_a = fut_a.result()
-        sig_b = fut_b.result()
-
-    if args.drift:
-        if not args.verbose:
-            log.progress(1, 2, "Analyzing drift")
-        result = drift_analysis(
-            sig_a, sig_b,
-            window_s=args.drift_window,
-            threshold_ms=args.drift_threshold,
-            max_drift_s=args.max_drift,
-            fps=fps,
-            verbose=args.verbose,
-        )
-        if not args.verbose:
-            log.progress_clear()
-        print(format_drift_result(result, fps))
-    else:
-        if not args.verbose:
-            log.progress(1, 2, "Computing correlation")
-        result = audio_correlate(sig_a, sig_b, fps, args.verbose)
-        if not args.verbose:
-            log.progress_clear()
-        print(format_result(result))
-        if result["confidence"] < 3:
-            log.warn("low confidence may indicate offset variability across the timeline.")
-            log.warn("try running with --drift to check for change points.")
 
 
 if __name__ == "__main__":
