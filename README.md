@@ -1,8 +1,8 @@
 # soroe
 
-Find the temporal offset(s) between two audio/video files of the same content.
+Find the temporal offset(s) between two audio/video files of the same content — including sources that drift or diverge from each other over time.
 
-Uses audio cross-correlation to determine how many milliseconds (and frames) one file is shifted relative to the other. Supports any format ffmpeg can read (MKV, MP4, FLAC, WAV, EAC3, M4A, MKA, etc.).
+Uses audio cross-correlation to determine how many milliseconds (and frames) one file is shifted relative to the other, either as a single global offset or as a series of change points across the timeline where the offset shifts. Supports any format ffmpeg can read (MKV, MP4, FLAC, WAV, EAC3, M4A, MKA, etc.).
 
 ## Requirements
 
