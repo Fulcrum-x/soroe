@@ -47,20 +47,20 @@ def _check_file(path: str) -> None:
         raise SoroeError(f"file not found: {path}")
 
 
-def _run_ffprobe(path: str, stream_type: str) -> bool:
-    """Return True if *path* contains at least one stream of *stream_type* ('audio' or 'video')."""
+def _count_audio_tracks(path: str) -> int:
+    """Return the number of audio streams in *path*."""
     try:
         r = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-select_streams", "a" if stream_type == "audio" else "v",
+                "-select_streams", "a",
                 "-show_entries", "stream=index",
                 "-of", "csv=p=0",
                 path,
             ],
             capture_output=True, text=True, timeout=30,
         )
-        return bool(r.stdout.strip())
+        return sum(1 for line in r.stdout.splitlines() if line.strip())
     except FileNotFoundError:
         # System-level: ffprobe missing. Always terminates, even in batch mode.
         log.error("ffprobe not found. Make sure ffmpeg is installed and on PATH.")
@@ -624,8 +624,19 @@ def _prepare_signals(
     if os.path.realpath(file1) == os.path.realpath(file2):
         raise SoroeError("both arguments point to the same file.")
 
-    if not _run_ffprobe(file1, "audio") or not _run_ffprobe(file2, "audio"):
+    count1 = _count_audio_tracks(file1)
+    count2 = _count_audio_tracks(file2)
+    if count1 == 0 or count2 == 0:
         raise SoroeError("one or both files lack an audio track.")
+    if audio_track >= count1 or audio_track >= count2:
+        parts: list[str] = []
+        if audio_track >= count1:
+            parts.append(f"{os.path.basename(file1)} has {count1} track{'s' if count1 != 1 else ''}")
+        if audio_track >= count2:
+            parts.append(f"{os.path.basename(file2)} has {count2} track{'s' if count2 != 1 else ''}")
+        raise SoroeError(
+            f"audio track index {audio_track} not available ({'; '.join(parts)})."
+        )
 
     dur1 = _get_duration(file1)
     dur2 = _get_duration(file2)
