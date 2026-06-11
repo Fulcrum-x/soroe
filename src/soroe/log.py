@@ -8,7 +8,7 @@ import sys
 # ANSI escape codes
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
-_DIM = "\033[2m"
+_DIM = "\033[90m"
 _RED = "\033[31m"
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
@@ -38,6 +38,14 @@ def yellow(s: str) -> str:
 
 def cyan(s: str) -> str:
     return f"{_CYAN}{s}{_RESET}"
+
+
+def format_timestamp(seconds: float) -> str:
+    """Format *seconds* as HH:MM:SS.s."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:04.1f}"
 
 
 def error(msg: str) -> None:

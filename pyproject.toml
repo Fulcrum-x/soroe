@@ -1,6 +1,6 @@
 [project]
 name = "soroe"
-version = "0.2.0"
+version = "1.0.0"
 description = "Find the temporal offset(s) between two audio/video files of the same content"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,3 +17,19 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/soroe"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.16",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Correctness only: syntax/runtime errors (E4/E7/E9), pyflakes (F), bugbear (B),
+# import order (I), and pyupgrade (UP) to codify the modern-hints convention.
+# Deliberately no pedantic/style sets; the formatter owns layout (E501 stays off
+# because long argparse help strings are allowed).
+select = ["E4", "E7", "E9", "F", "B", "I", "UP"]

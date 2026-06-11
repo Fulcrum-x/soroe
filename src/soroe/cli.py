@@ -1,745 +1,89 @@
-"""
-soroe - find the offset between two audio/video files of the same content.
-
-Determines how many milliseconds (and frames, given a known framerate) one file
-is offset from the other, so you can mux tracks between them with the correct delay.
-
-Supports any format ffmpeg can read (mkv, m4a, eac3, mka, mks, mp4, flac, wav, …).
-
-Requires: numpy, scipy, ffmpeg (on PATH)
-
-Usage:
-    soroe file1.mkv file2.mkv
-    soroe file1.mkv file2.mkv --duration 300 --verbose
-    soroe file1.flac file2.flac --drift --drift-threshold 80
-"""
+"""Command-line entry point: argument parsing and dispatch to the pipelines."""
 
 from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import numpy as np
-from scipy.signal import fftconvolve
+from . import __version__, log
+from .errors import SoroeError
+from .pipeline import run_drift, run_single_shot
 
-from . import log
 
-# Constants
-SAMPLE_RATE = 16_000          # Hz - mono 16 kHz for audio correlation
-
-
-class SoroeError(Exception):
-    """Expected per-input failure. Caught at the top level for a clean exit, or
-    per pair in batch mode so one bad file doesn't abort the whole run."""
-
-
-# Helpers
-def _log(msg: str, verbose: bool) -> None:
-    if verbose:
-        log.info(msg)
-
-
-def _check_file(path: str) -> None:
-    if not os.path.isfile(path):
-        raise SoroeError(f"file not found: {path}")
-
-
-def _count_audio_tracks(path: str) -> int:
-    """Return the number of audio streams in *path*."""
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0",
-                path,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        return sum(1 for line in r.stdout.splitlines() if line.strip())
-    except FileNotFoundError:
-        # System-level: ffprobe missing. Always terminates, even in batch mode.
-        log.error("ffprobe not found. Make sure ffmpeg is installed and on PATH.")
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        raise SoroeError(f"ffprobe timed out on {path}")
-
-
-def _get_fps(path: str) -> float | None:
-    """Return the framerate of the first video stream in *path*, or None if no video."""
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "csv=p=0",
-                path,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        val = r.stdout.strip()
-        if not val or "/" not in val:
-            return None
-        num, den = val.split("/")
-        return float(num) / float(den) if float(den) != 0 else None
-    except (ValueError, ZeroDivisionError, FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-
-
-def _get_duration(path: str) -> float:
-    """Return duration of *path* in seconds via ffprobe."""
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0",
-                path,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        return float(r.stdout.strip())
-    except (ValueError, subprocess.TimeoutExpired):
-        raise SoroeError(f"could not determine duration of {path}")
-
-
-def _format_timestamp(seconds: float) -> str:
-    """Format *seconds* as HH:MM:SS.s."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:04.1f}"
-
-
-# Audio extraction
-def extract_audio(path: str, duration: int, audio_track: int, verbose: bool) -> np.ndarray:
-    """Extract mono 16 kHz s16le PCM from *path* via ffmpeg pipe, return float32 array."""
-    _log(f"Extracting audio from {path} (track {audio_track}, {duration}s) …", verbose)
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-t", str(duration),
-        "-i", path,
-        "-map", f"0:a:{audio_track}",
-        "-ac", "1",
-        "-ar", str(SAMPLE_RATE),
-        "-f", "s16le",
-        "-acodec", "pcm_s16le",
-        "pipe:1",
-    ]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        # System-level: ffmpeg missing. Always terminates.
-        log.error("ffmpeg not found. Make sure ffmpeg is installed and on PATH.")
-        sys.exit(1)
-    raw, err = proc.communicate()
-    if proc.returncode != 0:
-        msg = err.decode(errors="replace").strip()
-        raise SoroeError(f"ffmpeg failed on {path}: {msg}")
-    if not raw:
-        raise SoroeError(f"no audio data extracted from {path}. Check that the file has an audio track.")
-
-    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    peak = np.max(np.abs(samples))
-    if peak > 0:
-        samples /= peak
-    _log(f" + Got {len(samples)} samples ({len(samples)/SAMPLE_RATE:.1f}s)", verbose)
-    return samples
-
-
-# Audio cross-correlation
-def _find_secondary_peak(corr: np.ndarray, primary_idx: int, min_distance: int) -> float:
-    """Return the value of the highest peak that is at least *min_distance* away from *primary_idx*."""
-    mask = np.ones(len(corr), dtype=bool)
-    lo = max(0, primary_idx - min_distance)
-    hi = min(len(corr), primary_idx + min_distance + 1)
-    mask[lo:hi] = False
-    masked = corr[mask]
-    if len(masked) == 0:
-        return 0.0
-    return float(np.max(masked))
-
-
-def audio_correlate(
-    sig_a: np.ndarray,
-    sig_b: np.ndarray,
-    fps: float | None,
-    verbose: bool,
-) -> dict:
-
-    """Return dict with offset_ms, confidence, and optional frame info."""
-    _log("Computing cross-correlation …", verbose)
-    # Cross-correlation via convolution: corr(a,b) = convolve(a, b[::-1])
-    corr = fftconvolve(sig_a, sig_b[::-1], mode="full")
-    corr = np.abs(corr)
-
-    peak_idx = int(np.argmax(corr))
-    peak_val = float(corr[peak_idx])
-
-    # lag: positive means sig_b is delayed relative to sig_a
-    # In 'full' mode the zero-lag position is at index len(sig_b)-1
-    lag_samples = peak_idx - (len(sig_b) - 1)
-    offset_ms = lag_samples / SAMPLE_RATE * 1000.0
-
-    # Confidence: ratio of primary to secondary peak
-    secondary = _find_secondary_peak(corr, peak_idx, min_distance=SAMPLE_RATE // 2)
-    confidence = peak_val / secondary if secondary > 0 else float("inf")
-
-    _log(f" + Peak at lag={lag_samples} samples, confidence={confidence:.2f}", verbose)
-
-    result: dict = {
-        "method": "audio cross-correlation",
-        "confidence": round(confidence, 2),
-        "offset_ms": round(offset_ms, 2),
-    }
-
-    if fps is not None:
-        offset_frames = offset_ms / 1000.0 * fps
-        nearest_frame = round(offset_frames)
-        result["offset_frames"] = round(offset_frames, 2)
-        result["fps"] = fps
-        result["nearest_frame"] = nearest_frame
-
-    return result
-
-
-# Output formatting
-def _confidence_label(ratio: float) -> str:
-    """Human-readable confidence mapping."""
-    if ratio >= 10:
-        return "excellent"
-    if ratio >= 5:
-        return "good"
-    if ratio >= 3:
-        return "fair"
-    if ratio >= 1.5:
-        return "poor"
-    return "unreliable"
-
-
-def _confidence_colored(ratio: float) -> str:
-    label = _confidence_label(ratio)
-    color = {
-        "excellent": log.green,
-        "good": log.green,
-        "fair": log.yellow,
-        "poor": log.red,
-        "unreliable": log.red,
-    }[label]
-    return color(label)
-
-
-def _header(title: str) -> list[str]:
-    text = f"soroe · {title}"
-    return [log.bold(text), log.dim("─" * len(text))]
-
-
-def _kv(key: str, value: str, note: str = "") -> str:
-    line = f"  {log.dim(key.ljust(12))}{value}"
-    if note:
-        line += "  " + log.dim(note)
-    return line
-
-
-def _fmt_offset(ms: float) -> str:
-    sign = "+" if ms >= 0 else ""
-    return f"{sign}{ms:.0f} ms"
-
-
-def format_result(result: dict) -> str:
-    lines: list[str] = _header(result["method"])
-    lines.append("")
-
-    ms = result["offset_ms"]
-    if ms >= 0:
-        desc = f"file2 delayed by {ms:.0f} ms"
-    else:
-        desc = f"file1 delayed by {-ms:.0f} ms"
-    lines.append(_kv("Offset", log.bold(_fmt_offset(ms)), desc))
-
-    if "fps" in result:
-        fps = result["fps"]
-        frames = result["offset_frames"]
-        nearest = result["nearest_frame"]
-        sign_f = "+" if frames >= 0 else ""
-        lines.append(_kv(
-            "Frames",
-            log.bold(f"{sign_f}{frames:.2f}"),
-            f"@ {fps:.3f} fps · nearest: {nearest}",
-        ))
-
-    conf = result["confidence"]
-    lines.append(_kv(
-        "Confidence",
-        _confidence_colored(conf),
-        f"{conf:.2f}x peak ratio",
-    ))
-
-    return "\n".join(lines)
-
-
-# Drift analysis - windowed cross-correlation with adaptive refinement
-
-def correlate_window(
-    sig_a: np.ndarray,
-    sig_b: np.ndarray,
-    window_start_samples: int,
-    window_size_samples: int,
-    search_radius_samples: int,
-) -> tuple[float, float] | None:
-    """Correlate a window from *sig_a* against a search region in *sig_b*.
-
-    Returns ``(offset_ms, confidence)`` or *None* if the window is too small.
-    """
-    w_start = window_start_samples
-    w_end = min(w_start + window_size_samples, len(sig_a))
-    a_win = sig_a[w_start:w_end]
-
-    if len(a_win) < window_size_samples // 4:
-        return None
-
-    b_start = max(0, w_start - search_radius_samples)
-    b_end = min(len(sig_b), w_start + window_size_samples + search_radius_samples)
-    b_search = sig_b[b_start:b_end]
-
-    if len(b_search) < len(a_win):
-        return None
-
-    corr = fftconvolve(a_win, b_search[::-1], mode="full")
-    corr = np.abs(corr)
-
-    peak_idx = int(np.argmax(corr))
-    peak_val = float(corr[peak_idx])
-
-    lag_in_corr = peak_idx - (len(b_search) - 1)
-    offset_samples = w_start - b_start + lag_in_corr
-    offset_ms = offset_samples / SAMPLE_RATE * 1000.0
-
-    secondary = _find_secondary_peak(corr, peak_idx, min_distance=SAMPLE_RATE // 2)
-    confidence = peak_val / secondary if secondary > 0 else float("inf")
-
-    return (round(offset_ms, 2), round(confidence, 2))
-
-
-def refine_change_point(
-    sig_a: np.ndarray,
-    sig_b: np.ndarray,
-    t_start_s: float,
-    t_end_s: float,
-    offset_before_ms: float,
-    offset_after_ms: float,
-    min_window_s: float,
-    search_radius_samples: int,
-    threshold_ms: float,
-) -> float:
-    """Binary-search *[t_start_s, t_end_s]* to pinpoint where the offset changes."""
-    if t_end_s - t_start_s <= min_window_s:
-        return (t_start_s + t_end_s) / 2.0
-
-    t_mid = (t_start_s + t_end_s) / 2.0
-    win_samples = max(
-        int(min_window_s * SAMPLE_RATE),
-        int((t_end_s - t_start_s) / 4 * SAMPLE_RATE),
-    )
-    mid_start = int(t_mid * SAMPLE_RATE)
-
-    result = correlate_window(sig_a, sig_b, mid_start, win_samples, search_radius_samples)
-    if result is None:
-        return (t_start_s + t_end_s) / 2.0
-
-    mid_offset_ms, _ = result
-
-    if abs(mid_offset_ms - offset_before_ms) >= threshold_ms:
-        return refine_change_point(
-            sig_a, sig_b, t_start_s, t_mid,
-            offset_before_ms, mid_offset_ms,
-            min_window_s, search_radius_samples, threshold_ms,
-        )
-    return refine_change_point(
-        sig_a, sig_b, t_mid, t_end_s,
-        mid_offset_ms, offset_after_ms,
-        min_window_s, search_radius_samples, threshold_ms,
-    )
-
-
-def drift_analysis(
-    sig_a: np.ndarray,
-    sig_b: np.ndarray,
-    window_s: int,
-    threshold_ms: int,
-    max_drift_s: int,
-    fps: float | None,
-    verbose: bool,
-) -> dict:
-    """Three-pass drift detection: coarse scan, change-point refinement, summary."""
-    window_samples = int(window_s * SAMPLE_RATE)
-    step_samples = window_samples // 2  # 50 % overlap
-    search_radius_samples = int(max_drift_s * SAMPLE_RATE)
-    min_window_s = 2.0
-    total_samples = min(len(sig_a), len(sig_b))
-    total_duration_s = total_samples / SAMPLE_RATE
-
-    # Pass 1: coarse windowed cross-correlation (parallel across windows)
-    _log("Pass 1: coarse windowed cross-correlation …", verbose)
-    positions: list[int] = []
-    pos = 0
-    while pos + window_samples // 4 <= total_samples:
-        positions.append(pos)
-        pos += step_samples
-
-    results_by_pos: dict[int, tuple[float, float] | None] = {}
-    workers = min(len(positions), os.cpu_count() or 4)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(
-                correlate_window,
-                sig_a, sig_b, p,
-                min(window_samples, total_samples - p),
-                search_radius_samples,
-            ): p
-            for p in positions
-        }
-        completed = 0
-        for fut in as_completed(futures):
-            p = futures[fut]
-            results_by_pos[p] = fut.result()
-            completed += 1
-            _log(f"Analyzed window {completed}/{len(positions)}", verbose)
-            if not verbose:
-                log.progress(completed, len(positions), "Scanning windows")
-
-    coarse: list[dict] = []
-    for p in positions:
-        result = results_by_pos.get(p)
-        if result is not None:
-            offset_ms, confidence = result
-            coarse.append({
-                "timestamp_s": p / SAMPLE_RATE,
-                "offset_ms": offset_ms,
-                "confidence": confidence,
-            })
-
-    if not coarse:
-        return {"segments": [], "change_points": [], "no_drift": True,
-                "window_s": window_s, "threshold_ms": threshold_ms}
-
-    # Filter outlier windows whose offset is far from both neighbors
-    if len(coarse) > 2:
-        max_jump_ms = max_drift_s * 1000
-        filtered = [coarse[0]]
-        for i in range(1, len(coarse) - 1):
-            pt = coarse[i]
-            close_prev = abs(pt["offset_ms"] - coarse[i - 1]["offset_ms"]) <= max_jump_ms
-            close_next = abs(pt["offset_ms"] - coarse[i + 1]["offset_ms"]) <= max_jump_ms
-            if close_prev or close_next:
-                filtered.append(pt)
-        filtered.append(coarse[-1])
-        if len(filtered) >= 2:
-            if abs(filtered[0]["offset_ms"] - filtered[1]["offset_ms"]) > max_jump_ms:
-                filtered.pop(0)
-        if len(filtered) >= 2:
-            if abs(filtered[-1]["offset_ms"] - filtered[-2]["offset_ms"]) > max_jump_ms:
-                filtered.pop()
-        if filtered:
-            coarse = filtered
-
-    # Pass 2: change-point detection & refinement
-    _log("Pass 2: detecting change points …", verbose)
-    change_points: list[dict] = []
-    for i in range(1, len(coarse)):
-        prev, curr = coarse[i - 1], coarse[i]
-        if abs(curr["offset_ms"] - prev["offset_ms"]) >= threshold_ms:
-            t_start = prev["timestamp_s"]
-            t_end = min(curr["timestamp_s"] + window_s, total_duration_s)
-            _log(
-                f" + Refining change between {_format_timestamp(t_start)} "
-                f"and {_format_timestamp(t_end)} …",
-                verbose,
-            )
-            cp_t = refine_change_point(
-                sig_a, sig_b, t_start, t_end,
-                prev["offset_ms"], curr["offset_ms"],
-                min_window_s, search_radius_samples, threshold_ms,
-            )
-            change_points.append({
-                "timestamp_s": cp_t,
-                "offset_before_ms": prev["offset_ms"],
-                "offset_after_ms": curr["offset_ms"],
-            })
-
-    change_points.sort(key=lambda cp: cp["timestamp_s"])
-
-    # Pass 3: compile segments
-    _log("Pass 3: compiling segments …", verbose)
-
-    def _avg(pts: list[dict], key: str) -> float:
-        return sum(p[key] for p in pts) / len(pts) if pts else 0.0
-
-    if not change_points:
-        avg_off = _avg(coarse, "offset_ms")
-        avg_conf = _avg(coarse, "confidence")
-        return {
-            "segments": [{
-                "start_s": 0.0, "end_s": total_duration_s,
-                "offset_ms": round(avg_off, 1), "confidence": round(avg_conf, 2),
-            }],
-            "change_points": [],
-            "no_drift": True,
-            "window_s": window_s,
-            "threshold_ms": threshold_ms,
-        }
-
-    transition_half = 1.5  # seconds each side of a change point
-    segments: list[dict] = []
-    seg_start = 0.0
-
-    for cp in change_points:
-        cp_t = cp["timestamp_s"]
-        seg_end = max(seg_start, cp_t - transition_half)
-
-        if seg_end > seg_start:
-            pts = [r for r in coarse if seg_start <= r["timestamp_s"] < seg_end]
-            segments.append({
-                "start_s": seg_start, "end_s": seg_end,
-                "offset_ms": round(_avg(pts, "offset_ms"), 1) if pts else cp["offset_before_ms"],
-                "confidence": round(_avg(pts, "confidence"), 2) if pts else 0.0,
-            })
-
-        trans_end = max(seg_end, min(cp_t + transition_half, total_duration_s))
-        segments.append({
-            "start_s": seg_end, "end_s": trans_end,
-            "offset_ms": None, "confidence": None,  # transition
-        })
-        seg_start = trans_end
-
-    if seg_start < total_duration_s:
-        pts = [r for r in coarse if r["timestamp_s"] >= seg_start]
-        segments.append({
-            "start_s": seg_start, "end_s": total_duration_s,
-            "offset_ms": round(_avg(pts, "offset_ms"), 1) if pts else change_points[-1]["offset_after_ms"],
-            "confidence": round(_avg(pts, "confidence"), 2) if pts else 0.0,
-        })
-
-    return {
-        "segments": segments,
-        "change_points": change_points,
-        "no_drift": False,
-        "window_s": window_s,
-        "threshold_ms": threshold_ms,
-    }
-
-
-# Output formatting
-def _format_segment(seg: dict, fps: float | None) -> str:
-    ts0 = _format_timestamp(seg["start_s"])
-    ts1 = _format_timestamp(seg["end_s"])
-    time_range = log.dim(f"{ts0} → {ts1}")
-
-    if seg["offset_ms"] is None:
-        return f"    {time_range}  {log.yellow('transition')}"
-
-    off = seg["offset_ms"]
-    conf_val = seg["confidence"]
-    offset_str = log.bold(_fmt_offset(off).rjust(8))
-    conf_str = f"{_confidence_colored(conf_val)} {log.dim(f'({conf_val:.2f}x)')}"
-
-    parts = [f"    {time_range}", offset_str, conf_str]
-    if fps is not None:
-        frames = off / 1000.0 * fps
-        sign = "+" if frames >= 0 else ""
-        parts.append(log.dim(f"{sign}{frames:.1f} frames"))
-    return "  ".join(parts)
-
-
-def format_drift_result(result: dict, fps: float | None) -> str:
-    """Format drift-analysis *result* for human consumption."""
-    lines: list[str] = _header("drift analysis")
-    w = result["window_s"]
-    thr = result["threshold_ms"]
-    lines.append(log.dim(f"  {w}s windows · {thr}ms threshold"))
-    lines.append("")
-
-    if result["no_drift"]:
-        lines.append(f"  {log.green('No drift detected.')}")
-        lines.append("")
-
-    lines.append(f"  {log.bold('Segments')}")
-    for seg in result["segments"]:
-        lines.append(_format_segment(seg, fps))
-
-    if result["change_points"]:
-        lines.append("")
-        lines.append(f"  {log.bold('Change points')}")
-        for cp in result["change_points"]:
-            ts = _format_timestamp(cp["timestamp_s"])
-            before = cp["offset_before_ms"]
-            after = cp["offset_after_ms"]
-            entry = (
-                f"    {log.dim(ts)}  "
-                f"{log.bold(_fmt_offset(before))} {log.dim('→')} {log.bold(_fmt_offset(after))}"
-            )
-            if fps is not None:
-                fb = before / 1000.0 * fps
-                fa = after / 1000.0 * fps
-                entry += "  " + log.dim(f"({fb:+.1f} → {fa:+.1f} frames)")
-            lines.append(entry)
-
-    lines.append("")
-    lines.append(f"  {log.bold('Summary')}")
-    non_transition = [s for s in result["segments"] if s["offset_ms"] is not None]
-    lines.append(f"    {log.dim('Segments'.ljust(16))}{len(non_transition)}")
-    lines.append(f"    {log.dim('Change points'.ljust(16))}{len(result['change_points'])}")
-    if result["change_points"]:
-        max_delta = max(
-            abs(cp["offset_after_ms"] - cp["offset_before_ms"])
-            for cp in result["change_points"]
-        )
-        lines.append(f"    {log.dim('Max drift'.ljust(16))}{log.bold(f'{max_delta:.0f} ms')}")
-
-    return "\n".join(lines)
-
-
-# Pipelines (shared by single-pair main() and batch.py)
-def _prepare_signals(
-    file1: str,
-    file2: str,
-    duration: int | None,
-    full_duration_if_unset: bool,
-    audio_track: int,
-    verbose: bool,
-) -> tuple[np.ndarray, np.ndarray, float | None]:
-    """Validate inputs and extract aligned-length audio signals from both files.
-
-    Raises SoroeError on any expected per-input failure (missing file, no audio
-    track, ffprobe/ffmpeg failure, same file passed twice).
-    """
-    _check_file(file1)
-    _check_file(file2)
-
-    if os.path.realpath(file1) == os.path.realpath(file2):
-        raise SoroeError("both arguments point to the same file.")
-
-    count1 = _count_audio_tracks(file1)
-    count2 = _count_audio_tracks(file2)
-    if count1 == 0 or count2 == 0:
-        raise SoroeError("one or both files lack an audio track.")
-    if audio_track >= count1 or audio_track >= count2:
-        parts: list[str] = []
-        if audio_track >= count1:
-            parts.append(f"{os.path.basename(file1)} has {count1} track{'s' if count1 != 1 else ''}")
-        if audio_track >= count2:
-            parts.append(f"{os.path.basename(file2)} has {count2} track{'s' if count2 != 1 else ''}")
-        log.warn(
-            f"audio track index {audio_track} not available ({'; '.join(parts)}); "
-            f"falling back to track 0."
-        )
-        audio_track = 0
-
-    dur1 = _get_duration(file1)
-    dur2 = _get_duration(file2)
-    if abs(dur1 - dur2) > 240:
-        log.warn(
-            f"file durations differ by {abs(dur1 - dur2):.0f}s "
-            f"({dur1:.0f}s vs {dur2:.0f}s). These may be different sources."
-        )
-
-    fps = _get_fps(file1) or _get_fps(file2)
-    if fps is not None:
-        _log(f"Detected framerate: {fps:.3f} fps", verbose)
-
-    if duration is not None:
-        dur = duration
-    elif full_duration_if_unset:
-        dur = int(min(dur1, dur2))
-        _log(f"Auto-detected duration: {dur}s (from shorter file)", verbose)
-    else:
-        dur = 600
-
-    if not verbose:
-        log.progress(0, 2, "Extracting audio (parallel)")
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_a = ex.submit(extract_audio, file1, dur, audio_track, verbose)
-        fut_b = ex.submit(extract_audio, file2, dur, audio_track, verbose)
-        sig_a = fut_a.result()
-        sig_b = fut_b.result()
-
-    return sig_a, sig_b, fps
-
-
-def run_single_shot(
-    file1: str,
-    file2: str,
-    duration: int | None,
-    audio_track: int,
-    verbose: bool,
-) -> str:
-    """Run global-offset analysis on one file pair and return the formatted output."""
-    sig_a, sig_b, fps = _prepare_signals(
-        file1, file2, duration, False, audio_track, verbose,
-    )
-    if not verbose:
-        log.progress(1, 2, "Computing correlation")
-    result = audio_correlate(sig_a, sig_b, fps, verbose)
-    if not verbose:
-        log.progress_clear()
-    output = format_result(result)
-    if result["confidence"] < 3:
-        log.warn("low confidence may indicate offset variability across the timeline.")
-        log.warn("try running with --drift to check for change points.")
-    return output
-
-
-def run_drift(
-    file1: str,
-    file2: str,
-    duration: int | None,
-    audio_track: int,
-    drift_window: int,
-    drift_threshold: int,
-    max_drift: int,
-    verbose: bool,
-) -> str:
-    """Run drift analysis on one file pair and return the formatted output."""
-    sig_a, sig_b, fps = _prepare_signals(
-        file1, file2, duration, True, audio_track, verbose,
-    )
-    if not verbose:
-        log.progress(1, 2, "Analyzing drift")
-    result = drift_analysis(
-        sig_a, sig_b,
-        window_s=drift_window,
-        threshold_ms=drift_threshold,
-        max_drift_s=max_drift,
-        fps=fps,
-        verbose=verbose,
-    )
-    if not verbose:
-        log.progress_clear()
-    return format_drift_result(result, fps)
-
-
-# Main
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="soroe",
-        description="Find the temporal offset between two audio/video files of the same content.",
-        formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=40),
+        description=f"soroe {__version__} - find temporal offsets between audio/video files.",
     )
     parser.add_argument("file1", help="First audio/video file or directory")
     parser.add_argument("file2", help="Second audio/video file or directory")
-    parser.add_argument("--duration", type=int, default=None, metavar="SEC", help="Seconds of content to analyze (default: 600, or full file with --drift)")
-    parser.add_argument("--audio-track", type=int, default=0, metavar="N", help="Audio track index to use (default: 0)")
-    parser.add_argument("--verbose", action="store_true", help="Print detailed progress and debug info")
-    parser.add_argument("--drift", action="store_true", help="Enable drift/divergence detection mode")
-    parser.add_argument("--drift-window", type=int, default=30, metavar="SEC", help="Window size in seconds for drift analysis (default: 30)")
-    parser.add_argument("--drift-threshold", type=int, default=70, metavar="MS", help="Minimum offset change in ms to count as a change point (default: 70)")
-    parser.add_argument("--max-drift", type=int, default=5, metavar="SEC", help="Maximum expected drift in seconds (default: 5)")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help=f"show soroe {__version__} and exit",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="Seconds of content to analyze (default: 600; full file with --drift)",
+    )
+    parser.add_argument(
+        "--audio-track",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Audio track index to use (default: 0)",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Print detailed progress and debug info"
+    )
+    parser.add_argument(
+        "--drift", action="store_true", help="Enable drift/divergence detection mode"
+    )
+    parser.add_argument(
+        "--drift-window",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="Window size in seconds for drift analysis (default: 30; see --prescan)",
+    )
+    parser.add_argument(
+        "--drift-threshold",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="Minimum offset change in ms to count as a change point "
+        "(default: auto from scan noise and framerate; previously fixed 70)",
+    )
+    parser.add_argument(
+        "--max-drift",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="Maximum expected drift in seconds around the detected base offset "
+        "(default: auto from the base-offset probes; previously fixed 5)",
+    )
+    parser.add_argument(
+        "--prescan",
+        action="store_true",
+        help="Calibrate the drift window size from the content before scanning (requires --drift)",
+    )
+    parser.add_argument(
+        "--saveoffsets",
+        "-so",
+        action="store_true",
+        help="Save drift segments/change points to ./offsets/<name>.txt (requires --drift)",
+    )
     args = parser.parse_args()
+
+    if args.saveoffsets and not args.drift:
+        parser.error("--saveoffsets requires --drift")
+    if args.prescan and not args.drift:
+        parser.error("--prescan requires --drift")
 
     a_is_dir = os.path.isdir(args.file1)
     b_is_dir = os.path.isdir(args.file2)
@@ -749,24 +93,33 @@ def main() -> None:
             raise SoroeError("both arguments must be files, or both must be directories.")
         if a_is_dir:
             from . import batch
+
             batch.run(args)
         elif args.drift:
-            print(run_drift(
-                args.file1, args.file2,
-                duration=args.duration,
-                audio_track=args.audio_track,
-                drift_window=args.drift_window,
-                drift_threshold=args.drift_threshold,
-                max_drift=args.max_drift,
-                verbose=args.verbose,
-            ))
+            print(
+                run_drift(
+                    args.file1,
+                    args.file2,
+                    duration=args.duration,
+                    audio_track=args.audio_track,
+                    drift_window=args.drift_window,
+                    drift_threshold=args.drift_threshold,
+                    max_drift=args.max_drift,
+                    prescan=args.prescan,
+                    verbose=args.verbose,
+                    save_offsets_as="offsets" if args.saveoffsets else None,
+                )
+            )
         else:
-            print(run_single_shot(
-                args.file1, args.file2,
-                duration=args.duration,
-                audio_track=args.audio_track,
-                verbose=args.verbose,
-            ))
+            print(
+                run_single_shot(
+                    args.file1,
+                    args.file2,
+                    duration=args.duration,
+                    audio_track=args.audio_track,
+                    verbose=args.verbose,
+                )
+            )
     except SoroeError as e:
         log.error(str(e))
         sys.exit(1)

@@ -12,7 +12,8 @@ import os
 import re
 
 from . import log
-from .cli import SoroeError, run_drift, run_single_shot
+from .errors import SoroeError
+from .pipeline import run_drift, run_single_shot
 
 # Matches S00E00 / s1e4 / etc. Capture groups are the season and episode numbers
 # so we can normalize to a canonical SxxEyy form regardless of input casing or padding.
@@ -59,7 +60,8 @@ def _scan_dir(path: str) -> tuple[dict[str, str], int]:
 
 
 def _pair_directories(
-    dir_a: str, dir_b: str,
+    dir_a: str,
+    dir_b: str,
 ) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
     """Pair files between two directories by SxxEyy token.
 
@@ -113,17 +115,21 @@ def run(args: argparse.Namespace) -> None:
         try:
             if args.drift:
                 output = run_drift(
-                    path_a, path_b,
+                    path_a,
+                    path_b,
                     duration=args.duration,
                     audio_track=args.audio_track,
                     drift_window=args.drift_window,
                     drift_threshold=args.drift_threshold,
                     max_drift=args.max_drift,
+                    prescan=args.prescan,
                     verbose=args.verbose,
+                    save_offsets_as=token if args.saveoffsets else None,
                 )
             else:
                 output = run_single_shot(
-                    path_a, path_b,
+                    path_a,
+                    path_b,
                     duration=args.duration,
                     audio_track=args.audio_track,
                     verbose=args.verbose,

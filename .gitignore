@@ -1,8 +1,15 @@
+# OS
 desktop.ini
+
+# Python
 __pycache__/
-.samples/
-.scratch/
-.claude/
-.venv/
 *.pyc
 *.egg-info/
+
+# Environment
+.venv/
+
+# Project-local
+.claude/
+.notes/
+.samples/
