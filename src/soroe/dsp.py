@@ -555,7 +555,8 @@ def drift_analysis(
         search_radius_samples = int(_DEFAULT_RADIUS_S * sample_rate)
     search_radius_s = round(search_radius_samples / sample_rate, 1)
     _log(
-        f"Search radius: ±{search_radius_s:g}s" + (" (auto)" if sources["radius"] == "auto" else ""),
+        f"Search radius: ±{search_radius_s:g}s"
+        + (" (auto)" if sources["radius"] == "auto" else ""),
         verbose,
     )
 
