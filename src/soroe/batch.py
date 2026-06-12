@@ -20,7 +20,8 @@ from .pipeline import run_drift, run_single_shot
 TOKEN_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,2})")
 
 
-def _extract_token(filename: str) -> str | None:
+def extract_token(filename: str) -> str | None:
+    """Return the canonical SxxEyy token found in *filename*, or None."""
     m = TOKEN_RE.search(filename)
     if not m:
         return None
@@ -43,7 +44,7 @@ def _scan_dir(path: str) -> tuple[dict[str, str], int]:
         full = os.path.join(path, name)
         if not os.path.isfile(full):
             continue
-        token = _extract_token(name)
+        token = extract_token(name)
         if token is None:
             log.warn(f"no SxxEyy token in {name}; skipping")
             no_token += 1

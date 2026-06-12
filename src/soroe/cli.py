@@ -95,31 +95,41 @@ def main() -> None:
             from . import batch
 
             batch.run(args)
-        elif args.drift:
-            print(
-                run_drift(
-                    args.file1,
-                    args.file2,
-                    duration=args.duration,
-                    audio_track=args.audio_track,
-                    drift_window=args.drift_window,
-                    drift_threshold=args.drift_threshold,
-                    max_drift=args.max_drift,
-                    prescan=args.prescan,
-                    verbose=args.verbose,
-                    save_offsets_as="offsets" if args.saveoffsets else None,
-                )
-            )
         else:
-            print(
-                run_single_shot(
-                    args.file1,
-                    args.file2,
-                    duration=args.duration,
-                    audio_track=args.audio_track,
-                    verbose=args.verbose,
+            from .batch import extract_token
+
+            token1 = extract_token(os.path.basename(args.file1))
+            token2 = extract_token(os.path.basename(args.file2))
+            if token1 and token2 and token1 != token2:
+                log.warn(
+                    f"Episode mismatch: {os.path.basename(args.file1)} is {token1}, "
+                    f"{os.path.basename(args.file2)} is {token2}; continuing anyway"
                 )
-            )
+            if args.drift:
+                print(
+                    run_drift(
+                        args.file1,
+                        args.file2,
+                        duration=args.duration,
+                        audio_track=args.audio_track,
+                        drift_window=args.drift_window,
+                        drift_threshold=args.drift_threshold,
+                        max_drift=args.max_drift,
+                        prescan=args.prescan,
+                        verbose=args.verbose,
+                        save_offsets_as="offsets" if args.saveoffsets else None,
+                    )
+                )
+            else:
+                print(
+                    run_single_shot(
+                        args.file1,
+                        args.file2,
+                        duration=args.duration,
+                        audio_track=args.audio_track,
+                        verbose=args.verbose,
+                    )
+                )
     except SoroeError as e:
         log.error(str(e))
         sys.exit(1)
