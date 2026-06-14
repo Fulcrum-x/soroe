@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 
@@ -12,6 +13,14 @@ from .pipeline import run_drift, run_single_shot
 
 
 def main() -> None:
+    # A redirected stdout/stderr on Windows defaults to the locale code page
+    # (cp1252), which cannot encode the report's box-drawing and arrow glyphs
+    # and crashes a piped run. Force UTF-8: it encodes every glyph, and also
+    # tidies redirected stderr logs (no backslash-escaped box characters).
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8")
+
     parser = argparse.ArgumentParser(
         prog="soroe",
         description=f"soroe {__version__} - find temporal offsets between audio/video files.",
