@@ -152,6 +152,7 @@ _AUTO_THRESHOLD_NOISE_MULT = 6.0  # sigma multiplier: scan jitter must not fire 
 _AUTO_THRESHOLD_RANGE_MS = (20.0, 70.0)  # sub-frame-jitter floor .. noticeable-desync ceiling
 _PRESCAN_CANDIDATES_S = (10, 15, 20, 30, 45)
 _PRESCAN_MIN_CONFIDENCE = 2.5  # median lock a candidate window size must clear across locations
+_REPAIR_TRUST_CONFIDENCE = 5.0  # a neighbor-re-anchored window must clear this to be adopted
 
 
 def _announce(msg: str) -> None:
@@ -297,6 +298,78 @@ def _calibrate_window_s(
         if median_conf >= _PRESCAN_MIN_CONFIDENCE:
             return w
     return None
+
+
+def _repair_coarse(
+    sig_a: np.ndarray,
+    sig_b: np.ndarray,
+    positions: list[int],
+    results_by_pos: dict[int, tuple[float, float] | None],
+    window_samples: int,
+    total_samples: int,
+    search_radius_samples: int,
+    sample_rate: int,
+    interpolate: bool,
+    verbose: bool,
+) -> int:
+    """Re-search weak coarse windows anchored on confident neighbors.
+
+    Pass 1 centers every window's search on a single global base offset, so a
+    window whose true offset falls outside that band locks onto in-band noise
+    (low confidence) even though a clean peak exists elsewhere. Here each weak
+    window is re-correlated with the search band re-centered on a confident
+    neighbor's offset, and the result is adopted only if the re-search itself
+    clears the trust bar. Confident windows flood-fill outward into contiguous
+    weak regions over repeated passes. Returns the number of windows repaired.
+    """
+    trust = _REPAIR_TRUST_CONFIDENCE
+
+    def _solid(p: int) -> bool:
+        r = results_by_pos.get(p)
+        return r is not None and r[1] >= trust
+
+    solid = {p: _solid(p) for p in positions}
+    # Nothing to propagate from, or nothing left to propagate into.
+    if not any(solid.values()) or all(solid.values()):
+        return 0
+
+    repaired = 0
+    for _ in range(len(positions)):  # bounded flood-fill; one frontier step per pass
+        improved = False
+        for idx, p in enumerate(positions):
+            if solid[p]:
+                continue
+            anchors_ms: list[float] = []
+            for j in (idx - 1, idx + 1):
+                if 0 <= j < len(positions):
+                    neighbor = results_by_pos[positions[j]]
+                    if neighbor is not None and neighbor[1] >= trust:
+                        anchors_ms.append(neighbor[0])
+            if not anchors_ms:
+                continue
+            best: tuple[float, float] | None = None
+            for off_ms in anchors_ms:
+                anchor = int(round(off_ms / 1000.0 * sample_rate))
+                res = correlate_window(
+                    sig_a,
+                    sig_b,
+                    p,
+                    min(window_samples, total_samples - p),
+                    search_radius_samples,
+                    sample_rate,
+                    interpolate,
+                    anchor,
+                )
+                if res is not None and res[1] >= trust and (best is None or res[1] > best[1]):
+                    best = res
+            if best is not None:
+                results_by_pos[p] = best
+                solid[p] = True
+                improved = True
+                repaired += 1
+        if not improved:
+            break
+    return repaired
 
 
 def refine_change_point(
@@ -627,6 +700,25 @@ def drift_analysis(
     if not verbose:
         log.progress_clear()
 
+    # Repair windows whose true offset fell outside the global anchor's band by
+    # re-searching them centered on confident neighbors (continuity). This is
+    # what rescues large staircase drifts whose extremes the single base-offset
+    # anchor plus a symmetric radius cannot all reach at once.
+    repaired = _repair_coarse(
+        sig_a,
+        sig_b,
+        positions,
+        results_by_pos,
+        window_samples,
+        total_samples,
+        search_radius_samples,
+        sample_rate,
+        interpolate,
+        verbose,
+    )
+    if repaired:
+        _log(f" + Repaired {repaired} weak window(s) by re-anchoring on neighbors", verbose)
+
     coarse: list[dict] = []
     for p in positions:
         result = results_by_pos.get(p)
@@ -738,6 +830,11 @@ def drift_analysis(
             # centers, give or take half a scan step.
             t_start = max(0.0, prev["timestamp_s"] - step_s / 2)
             t_end = min(curr["timestamp_s"] + step_s / 2, total_duration_s)
+            # Anchor the refinement probes on this boundary's own two levels,
+            # not the global base offset: a change into or out of a repaired
+            # segment lies outside the global band, so a globally anchored probe
+            # could not lock either side and would stall at the bracket midpoint.
+            cp_anchor = int(round((prev["offset_ms"] + curr["offset_ms"]) / 2000.0 * sample_rate))
             _log(
                 f" + Refining change between {log.format_timestamp(t_start)} "
                 f"and {log.format_timestamp(t_end)} …",
@@ -755,7 +852,7 @@ def drift_analysis(
                 refine_threshold_ms,
                 sample_rate,
                 interpolate,
-                anchor_samples,
+                cp_anchor,
                 slope_ms_per_s,
                 intercept_ms,
             )
