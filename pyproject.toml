@@ -1,6 +1,6 @@
 [project]
 name = "soroe"
-version = "1.0.0"
+version = "1.0.1"
 description = "Find the temporal offset(s) between two audio/video files of the same content"
 requires-python = ">=3.10"
 dependencies = [
