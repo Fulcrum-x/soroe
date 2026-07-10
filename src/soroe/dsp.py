@@ -592,7 +592,7 @@ def drift_analysis(
         if len(b_dec) < len(a_win):
             continue
         # The prescan can still calibrate here even if the gate below drops the
-        # probe: its search is anchored and in-band, unlike this full-file one.
+        # probe.
         probe_positions.append(p * dec)
         corr = np.abs(_phat_correlate(a_win, b_dec, rho=0.0))
         peak_idx = int(np.argmax(corr))
