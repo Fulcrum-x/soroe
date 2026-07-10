@@ -148,6 +148,12 @@ _DEFAULT_WINDOW_S = 30  # fixed --drift-window default; --prescan calibrates ins
 _DEFAULT_RADIUS_S = 5.0  # auto --max-drift fallback when the probes carry no dispersion info
 _DEFAULT_THRESHOLD_MS = 70.0  # auto --drift-threshold fallback; also the probe-margin floor
 _AUTO_RADIUS_FLOOR_S = 3.0  # the auto radius never narrows below this (covers real step edits)
+# Ceiling on the auto radius. Pass-1 transient FFT memory per window is roughly
+# (window + 2*radius) * sample_rate * ~28 bytes across os.cpu_count() threads:
+# at 120 s that is ~120 MB/window, ~4 GiB on a 32-thread machine, while real
+# drift around the anchor rarely spans more than tens of seconds. Explicit
+# --max-drift and the widen-and-warn path are not clamped.
+_AUTO_RADIUS_CEIL_S = 120.0
 _AUTO_THRESHOLD_NOISE_MULT = 6.0  # sigma multiplier: scan jitter must not fire change points
 _AUTO_THRESHOLD_RANGE_MS = (20.0, 70.0)  # sub-frame-jitter floor .. noticeable-desync ceiling
 _PRESCAN_CANDIDATES_S = (10, 15, 20, 30, 45)
@@ -579,15 +585,36 @@ def drift_analysis(
     probe_span = max(1, len(a_dec) - probe_win)
     probe_offsets: list[float] = []
     probe_positions: list[int] = []  # full-rate window starts, reused by the prescan
+    probes_dropped = 0
     for i in range(n_probes):
         p = int(probe_span * (i + 0.5) / n_probes)
         a_win = a_dec[p : p + probe_win]
         if len(b_dec) < len(a_win):
             continue
+        # The prescan can still calibrate here even if the gate below drops the
+        # probe: its search is anchored and in-band, unlike this full-file one.
         probe_positions.append(p * dec)
         corr = np.abs(_phat_correlate(a_win, b_dec, rho=0.0))
-        lag = int(np.argmax(corr)) - (len(b_dec) - 1)
+        peak_idx = int(np.argmax(corr))
+        peak_val = float(corr[peak_idx])
+        # Gate each probe on its peak-to-sidelobe ratio: an unanchored full-file
+        # argmax over hours of audio can tie with noise, and one spurious lock
+        # would blow up the dispersion evidence (the median survives an outlier;
+        # the max-deviation and max-adjacent-diff terms do not).
+        secondary = _find_secondary_peak(corr, peak_idx, min_distance=dec_rate // 2)
+        confidence = (
+            min(peak_val / secondary, _MAX_CONFIDENCE) if secondary > 0 else _MAX_CONFIDENCE
+        )
+        if peak_val <= 0.0 or confidence < _CONFIDENCE_FLOOR:
+            probes_dropped += 1
+            continue
+        lag = peak_idx - (len(b_dec) - 1)
         probe_offsets.append((p + lag) / dec_rate * 1000.0)
+    if probes_dropped:
+        log.warn(
+            f"discarded {probes_dropped} of {n_probes} base-offset probe(s) "
+            f"with no usable alignment."
+        )
     if probe_offsets:
         base_offset_ms = float(np.median(probe_offsets))
     else:
@@ -619,10 +646,18 @@ def drift_analysis(
     elif len(probe_offsets) >= 2:
         _log(
             f" + Radius evidence: probe dispersion {deviation_ms:.0f} ms, "
-            f"margin {margin_ms:.0f} ms",
+            f"margin {margin_ms:.0f} ms"
+            + (f", {probes_dropped} probe(s) dropped" if probes_dropped else ""),
             verbose,
         )
         radius_ms = max(deviation_ms + margin_ms, _AUTO_RADIUS_FLOOR_S * 1000.0)
+        if radius_ms > _AUTO_RADIUS_CEIL_S * 1000.0:
+            log.warn(
+                f"probe evidence asked for a ±{radius_ms / 1000.0:.0f}s search radius; "
+                f"capping at ±{_AUTO_RADIUS_CEIL_S:g}s to bound memory. "
+                f"Pass --max-drift to search wider."
+            )
+            radius_ms = _AUTO_RADIUS_CEIL_S * 1000.0
         search_radius_samples = int(radius_ms / 1000.0 * sample_rate)
     else:
         search_radius_samples = int(_DEFAULT_RADIUS_S * sample_rate)
