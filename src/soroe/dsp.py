@@ -81,7 +81,7 @@ def _find_secondary_peak(corr: np.ndarray, primary_idx: int, min_distance: int) 
 def _parabolic_peak_offset(corr: np.ndarray, peak_idx: int) -> float:
     """Sub-sample peak refinement via parabolic interpolation around *peak_idx*.
 
-    Returns a fractional sample delta in roughly [-0.5, 0.5]; 0.0 when the peak
+    Returns a fractional sample delta clamped to [-0.5, 0.5]; 0.0 when the peak
     is at an edge or the curvature is degenerate.
     """
     if peak_idx <= 0 or peak_idx >= len(corr) - 1:
@@ -92,7 +92,7 @@ def _parabolic_peak_offset(corr: np.ndarray, peak_idx: int) -> float:
     denom = y0 - 2.0 * y1 + y2
     if denom == 0.0:
         return 0.0
-    return 0.5 * (y0 - y2) / denom
+    return max(-0.5, min(0.5, 0.5 * (y0 - y2) / denom))
 
 
 def audio_correlate(
@@ -181,7 +181,8 @@ def correlate_window(
 
     The search region in *sig_b* is centered at the window position shifted by
     *anchor_offset_samples* (the expected global offset), so the search radius
-    bounds drift around that anchor rather than the offset itself. Returns
+    bounds drift around that anchor rather than the offset itself. Skip 
+    interpolation if the peak lands on either edge of the search band. Returns
     ``(offset_ms, confidence)`` — offset_ms is the global offset — or *None*
     if there is too little signal to search.
     """
@@ -223,7 +224,11 @@ def correlate_window(
     if peak_val <= 0.0:
         return None  # no correlation energy in the allowed range (silence)
 
-    peak_pos = peak_idx + (_parabolic_peak_offset(corr, peak_idx) if interpolate else 0.0)
+    # Band edge argmax cannot be trusted and the integer boundary should be 
+    # considered the best in-band estimate in this case.
+    at_band_edge = band_idx == 0 or band_idx == len(band) - 1
+    do_interpolate = interpolate and not at_band_edge
+    peak_pos = peak_idx + (_parabolic_peak_offset(corr, peak_idx) if do_interpolate else 0.0)
     lag_in_corr = peak_pos - zero_idx
     offset_samples = w_start - b_start + lag_in_corr
     offset_ms = offset_samples / sample_rate * 1000.0
